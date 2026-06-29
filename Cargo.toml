@@ -1,0 +1,18 @@
+[package]
+name = "flirpi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flirpi"
+path = "src/main.rs"
+
+[dependencies]
+rusb = { version = "0.9", features = ["vendored"] }
+libc  = "0.2"
+
+[profile.release]
+opt-level   = 3
+lto         = true
+strip       = "symbols"
+codegen-units = 1

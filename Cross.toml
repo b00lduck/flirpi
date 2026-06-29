@@ -1,0 +1,9 @@
+# Configuration for the `cross` cross-compilation tool (https://github.com/cross-rs/cross).
+#
+# Uses the :edge image (Ubuntu 22.04, glibc 2.35) to avoid "GLIBC_2.3x not found"
+# errors on rolling-release hosts (Arch, etc.).
+#
+# No pre-build steps are needed because rusb is built with features = ["vendored"],
+# which compiles libusb from source — no ARM libusb package required.
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:edge"
