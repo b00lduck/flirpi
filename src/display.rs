@@ -306,6 +306,15 @@ impl Framebuffer {
         let ctr_oy = fb_h / 2 + n * (5 * scale + 1) / 2;
         draw_text_ccw(fb, stride, bytes_pp, fb_w, fb_h, ctr_ox, ctr_oy, &ctr_label, scale);
 
+        // FLIRPI logo — physical bottom-right corner (screen top-right), 50% transparent.
+        let logo_scale = (scale + 1).max(2);
+        let logo_text = "FLIRPI";
+        let n_logo = logo_text.chars().count();
+        let logo_ox = fb_w.saturating_sub(7 * logo_scale + 7);
+        let logo_oy = (4 + n_logo * (5 * logo_scale + 1)).saturating_sub(3);
+        draw_logo_ccw(fb, stride, bytes_pp, fb_w, fb_h, logo_ox, logo_oy,
+                      logo_text, logo_scale, 0xFF, 0xFF, 0xFF, 128);
+
         // Flush shadow buffer to framebuffer in one shot to avoid tearing.
         let hw = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.map_size) };
         hw.copy_from_slice(&self.shadow);
@@ -404,6 +413,9 @@ fn char_bitmap(c: char) -> Option<[u8; 7]> {
         'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
         'X' => [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b01010, 0b10001],
+        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         ' ' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
         _ => return None,
     })
@@ -455,6 +467,53 @@ fn draw_text_ccw(
                                 put16(fb, py * stride + px * bytes_pp, 0xFF, 0xFF, 0xFF);
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Like draw_text_ccw but no outline; blends fill color with the existing pixel
+// at `alpha` (0 = fully transparent, 255 = opaque).
+fn draw_logo_ccw(
+    fb: &mut [u8],
+    stride: usize,
+    bytes_pp: usize,
+    fb_w: usize,
+    fb_h: usize,
+    ox: usize,
+    oy: usize,
+    text: &str,
+    scale: usize,
+    r: u8, g: u8, b: u8,
+    alpha: u8,
+) {
+    let char_step = 5 * scale + 1;
+    for (i, c) in text.chars().enumerate() {
+        let Some(bm) = char_bitmap(c) else { continue };
+        let char_oy = oy as isize - i as isize * char_step as isize;
+        if char_oy + 5 * scale as isize <= 0 { break; }
+        let char_oy = char_oy.max(0) as usize;
+        for row in 0..7usize {
+            for col in 0..5usize {
+                if bm[row] & (0x10 >> col) == 0 { continue; }
+                for sy in 0..scale {
+                    let py = char_oy + (4 - col) * scale + sy;
+                    for sx in 0..scale {
+                        let px = ox + row * scale + sx;
+                        if px >= fb_w || py >= fb_h { continue; }
+                        let off = py * stride + px * bytes_pp;
+                        // Read back current RGB565 pixel and blend
+                        let cur = u16::from_le_bytes([fb[off], fb[off + 1]]);
+                        let br = (((cur >> 11) & 0x1F) as u8) << 3;
+                        let bg = (((cur >> 5)  & 0x3F) as u8) << 2;
+                        let bb = ((cur         & 0x1F) as u8) << 3;
+                        let a = alpha as u16;
+                        let nr = ((r as u16 * a + br as u16 * (255 - a)) / 255) as u8;
+                        let ng = ((g as u16 * a + bg as u16 * (255 - a)) / 255) as u8;
+                        let nb = ((b as u16 * a + bb as u16 * (255 - a)) / 255) as u8;
+                        put16(fb, off, nr, ng, nb);
                     }
                 }
             }
