@@ -246,6 +246,31 @@ impl Framebuffer {
                 }
             }
         }
+
+        // Crosshair overlay
+        let cx = fb_w / 2;
+        let cy = fb_h / 2;
+        const GAP: usize = 5;
+        const ARM: usize = 14;
+        for dx in cx.saturating_sub(ARM + GAP)..=((cx + ARM + GAP).min(fb_w - 1)) {
+            if dx < cx.saturating_sub(GAP) || dx > cx + GAP {
+                put16(fb, cy * stride + dx * bytes_pp, 0xFF, 0xFF, 0xFF);
+            }
+        }
+        for dy in cy.saturating_sub(ARM + GAP)..=((cy + ARM + GAP).min(fb_h - 1)) {
+            if dy < cy.saturating_sub(GAP) || dy > cy + GAP {
+                put16(fb, dy * stride + cx * bytes_pp, 0xFF, 0xFF, 0xFF);
+            }
+        }
+
+        // Temperature annotation — rotated -90° (reads bottom-to-top), right of crosshair.
+        let temp_c = frame.center_raw as f32 * 0.01 - 273.15;
+        let label = format!("{:.1}C", temp_c);
+        let scale = (fb_h / 120).max(1);
+        let label_h = label.chars().count() * (5 * scale + 1);
+        let tx = (cx + GAP + 3).min(fb_w.saturating_sub(7 * scale));
+        let ty = cy.saturating_sub(label_h / 2);
+        draw_text_rot90ccw(fb, stride, bytes_pp, fb_w, fb_h, tx, ty, &label, scale);
     }
 }
 
@@ -265,4 +290,96 @@ unsafe impl Send for Framebuffer {}
 
 fn encode565(r: u8, g: u8, b: u8) -> u16 {
     ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
+}
+
+#[inline]
+fn put16(fb: &mut [u8], off: usize, r: u8, g: u8, b: u8) {
+    if off + 1 < fb.len() {
+        let p = encode565(r, g, b).to_le_bytes();
+        fb[off] = p[0];
+        fb[off + 1] = p[1];
+    }
+}
+
+// 5×7 bitmap font — each entry is 7 rows; bit 4 = leftmost column.
+fn char_bitmap(c: char) -> Option<[u8; 7]> {
+    Some(match c {
+        '0' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        '3' => [0b01110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b01110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110],
+        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00001, 0b00010, 0b00100, 0b00100, 0b00100],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        _ => return None,
+    })
+}
+
+// Draw a single glyph rotated -90° (CCW) at screen position (ox, oy).
+// Rotated glyph is 7*scale wide × 5*scale tall.
+// Two passes: black outline first, white fill second — readable on any background.
+fn draw_glyph_rot90ccw(
+    fb: &mut [u8],
+    stride: usize,
+    bytes_pp: usize,
+    fb_w: usize,
+    fb_h: usize,
+    ox: usize,
+    oy: usize,
+    bm: [u8; 7],
+    scale: usize,
+) {
+    for pass in 0..2u8 {
+        for row in 0..7usize {
+            for col in 0..5usize {
+                if bm[row] & (0x10 >> col) == 0 { continue; }
+                // +90°: top row → left side, left col → bottom
+                for sy in 0..scale {
+                    let py = oy + (4 - col) * scale + sy;
+                    for sx in 0..scale {
+                        let px = ox + row * scale + sx;
+                        if pass == 0 {
+                            for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)] {
+                                let qx = px as i32 + dx;
+                                let qy = py as i32 + dy;
+                                if qx >= 0 && (qx as usize) < fb_w && qy >= 0 && (qy as usize) < fb_h {
+                                    put16(fb, qy as usize * stride + qx as usize * bytes_pp, 0, 0, 0);
+                                }
+                            }
+                        } else if px < fb_w && py < fb_h {
+                            put16(fb, py * stride + px * bytes_pp, 0xFF, 0xFF, 0xFF);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Draw a string rotated -90°, characters stacked bottom-to-top, anchored at (ox, oy) top-left.
+fn draw_text_rot90ccw(
+    fb: &mut [u8],
+    stride: usize,
+    bytes_pp: usize,
+    fb_w: usize,
+    fb_h: usize,
+    ox: usize,
+    oy: usize,
+    text: &str,
+    scale: usize,
+) {
+    let char_h = 5 * scale + 1; // rotated char height + 1px gap
+    let n = text.chars().count();
+    for (i, c) in text.chars().enumerate() {
+        let Some(bm) = char_bitmap(c) else { continue };
+        // +90° CW reads bottom-to-top → first char at bottom (largest y)
+        let cy = oy + (n - 1 - i) * char_h;
+        draw_glyph_rot90ccw(fb, stride, bytes_pp, fb_w, fb_h, ox, cy, bm, scale);
+    }
 }

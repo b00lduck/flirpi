@@ -36,6 +36,8 @@ const MAGIC: [u8; 4] = [0xEF, 0xBE, 0x00, 0x00];
 pub struct ThermalFrame {
     /// Min-max normalised grayscale, indexed [y * THERMAL_W + x].
     pub gray: [u8; THERMAL_W * THERMAL_H],
+    /// Raw centikelvins at the centre pixel (divide by 100 − 273.15 for °C).
+    pub center_raw: u16,
 }
 
 pub struct FrameAccumulator {
@@ -151,7 +153,8 @@ fn extract_thermal(frame: &[u8]) -> ThermalFrame {
         };
     }
 
-    ThermalFrame { gray }
+    let center_raw = raw[(THERMAL_H / 2) * THERMAL_W + THERMAL_W / 2];
+    ThermalFrame { gray, center_raw }
 }
 
 fn u32_le(buf: &[u8], off: usize) -> u32 {
