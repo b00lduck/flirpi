@@ -103,6 +103,7 @@ pub struct Framebuffer {
     map_size: usize,
     vinfo: FbVarScreeninfo,
     line_length: u32,
+    shadow: Vec<u8>,
 }
 
 impl Framebuffer {
@@ -164,6 +165,7 @@ impl Framebuffer {
             map_size,
             vinfo,
             line_length: finfo.line_length,
+            shadow: vec![0u8; map_size],
         })
     }
 
@@ -198,7 +200,7 @@ impl Framebuffer {
         let bytes_pp = bpp / 8;
         let stride = self.line_length as usize;
 
-        let fb = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.map_size) };
+        let fb = &mut self.shadow;
 
         let tw = THERMAL_W as f32;
         let th = THERMAL_H as f32;
@@ -247,30 +249,66 @@ impl Framebuffer {
             }
         }
 
-        // Crosshair overlay
-        let cx = fb_w / 2;
-        let cy = fb_h / 2;
-        const GAP: usize = 5;
-        const ARM: usize = 14;
-        for dx in cx.saturating_sub(ARM + GAP)..=((cx + ARM + GAP).min(fb_w - 1)) {
-            if dx < cx.saturating_sub(GAP) || dx > cx + GAP {
-                put16(fb, cy * stride + dx * bytes_pp, 0xFF, 0xFF, 0xFF);
-            }
-        }
-        for dy in cy.saturating_sub(ARM + GAP)..=((cy + ARM + GAP).min(fb_h - 1)) {
-            if dy < cy.saturating_sub(GAP) || dy > cy + GAP {
-                put16(fb, dy * stride + cx * bytes_pp, 0xFF, 0xFF, 0xFF);
-            }
-        }
+        // Center crosshair
+        draw_crosshair(fb, stride, bytes_pp, fb_w, fb_h, fb_w / 2, fb_h / 2, 5, 14);
 
-        // Temperature annotation — rotated -90° (reads bottom-to-top), right of crosshair.
-        let temp_c = frame.center_raw as f32 * 0.01 - 273.15;
-        let label = format!("{:.1}C", temp_c);
+        // Min/max crosshairs (smaller)
+        let scale_x = fb_w as f32 / THERMAL_W as f32;
+        let scale_y = fb_h as f32 / THERMAL_H as f32;
+        let (mnx, mny) = frame.min_pos;
+        let (mxx, mxy) = frame.max_pos;
+        let mn_fx = (mnx as f32 * scale_x + 0.5) as usize;
+        let mn_fy = (mny as f32 * scale_y + 0.5) as usize;
+        let mx_fx = (mxx as f32 * scale_x + 0.5) as usize;
+        let mx_fy = (mxy as f32 * scale_y + 0.5) as usize;
+        draw_crosshair(fb, stride, bytes_pp, fb_w, fb_h, mn_fx, mn_fy, 3, 7);
+        draw_crosshair(fb, stride, bytes_pp, fb_w, fb_h, mx_fx, mx_fy, 3, 7);
+
+        // Palette legend — physical top edge (screen left), centred left-right physically.
+        // On CCW display: physical left-right → screen y, physical top-inward → screen x.
         let scale = (fb_h / 120).max(1);
-        let label_h = label.chars().count() * (5 * scale + 1);
-        let tx = (cx + GAP + 3).min(fb_w.saturating_sub(7 * scale));
-        let ty = cy.saturating_sub(label_h / 2);
-        draw_text_rot90ccw(fb, stride, bytes_pp, fb_w, fb_h, tx, ty, &label, scale);
+        let leg_len = 200usize; // along screen y = physical left-right
+        let leg_w   = 10usize;  // along screen x = physical top-inward
+        let leg_x0  = 2usize;                    // near screen left = physical top edge
+        let leg_y0  = fb_h / 2 - leg_len / 2;   // centred in screen y
+        // White border
+        for x in leg_x0.saturating_sub(1)..=(leg_x0 + leg_w).min(fb_w - 1) {
+            for y in leg_y0.saturating_sub(1)..=(leg_y0 + leg_len).min(fb_h - 1) {
+                if x < leg_x0 || x >= leg_x0 + leg_w || y < leg_y0 || y >= leg_y0 + leg_len {
+                    put16(fb, y * stride + x * bytes_pp, 0xFF, 0xFF, 0xFF);
+                }
+            }
+        }
+        // Gradient along screen y: small y = physical right (hot), large y = physical left (cold)
+        for by in 0..leg_len {
+            let idx = 255 - by * 255 / (leg_len - 1);
+            let [r, g, b] = palette[idx];
+            for bx in 0..leg_w {
+                put16(fb, (leg_y0 + by) * stride + (leg_x0 + bx) * bytes_pp, r, g, b);
+            }
+        }
+        // Labels below the bar (+3px down = +3 screen x), max right-aligned, min left-aligned.
+        let char_step = 5 * scale + 1;
+        let label_ox  = leg_x0 + leg_w + 2 + 3;
+        let max_label = format!("{:.1}C", lepton2_celsius(frame.max_raw));
+        let min_label = format!("{:.1}C", lepton2_celsius(frame.min_raw));
+        // max right-aligned: last char's right edge at leg_y0 (hot/right end of bar)
+        let hot_oy  = leg_y0 + (max_label.chars().count() - 1) * char_step;
+        // min left-aligned: first char's left edge at leg_y0 + leg_len (cold/left end of bar)
+        let cold_oy = leg_y0 + leg_len - 1 - 4 * scale;
+        draw_text_ccw(fb, stride, bytes_pp, fb_w, fb_h, label_ox, hot_oy,  &max_label, scale);
+        draw_text_ccw(fb, stride, bytes_pp, fb_w, fb_h, label_ox, cold_oy, &min_label, scale);
+
+        // Center temperature just to the right of the center crosshair (screen x).
+        let ctr_label = format!("{:.1}C", lepton2_celsius(frame.center_raw));
+        let n = ctr_label.chars().count();
+        let ctr_ox = fb_w / 2 + 20; // past crosshair arm (14) + gap (5) + small margin
+        let ctr_oy = fb_h / 2 + n * (5 * scale + 1) / 2;
+        draw_text_ccw(fb, stride, bytes_pp, fb_w, fb_h, ctr_ox, ctr_oy, &ctr_label, scale);
+
+        // Flush shadow buffer to framebuffer in one shot to avoid tearing.
+        let hw = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.map_size) };
+        hw.copy_from_slice(&self.shadow);
     }
 }
 
@@ -285,6 +323,48 @@ impl Drop for Framebuffer {
 
 // Safety: Framebuffer owns its mmap'd memory exclusively.
 unsafe impl Send for Framebuffer {}
+
+// ── Temperature conversion ───────────────────────────────────────────────────
+
+// Inverse Planck law for this Lepton 2 unit.
+// Scale and offset fitted via 2-point calibration (3010→28.4°C, 3500→36.5°C).
+// ponytail: B and R1/R2 are Lepton 2 Planck constants; retune scale/offset if swapping units.
+fn draw_crosshair(fb: &mut [u8], stride: usize, bytes_pp: usize, fb_w: usize, fb_h: usize,
+                  cx: usize, cy: usize, gap: usize, arm: usize) {
+    let pixels: Vec<(usize, usize)> = {
+        let mut v = Vec::new();
+        for dx in cx.saturating_sub(arm + gap)..=((cx + arm + gap).min(fb_w - 1)) {
+            if dx < cx.saturating_sub(gap) || dx > cx + gap {
+                v.push((dx, cy));
+            }
+        }
+        for dy in cy.saturating_sub(arm + gap)..=((cy + arm + gap).min(fb_h - 1)) {
+            if dy < cy.saturating_sub(gap) || dy > cy + gap {
+                v.push((cx, dy));
+            }
+        }
+        v
+    };
+    for &(px, py) in &pixels {
+        for (dx, dy) in [(-1i32,0),(1,0),(0,-1i32),(0,1)] {
+            let qx = px as i32 + dx;
+            let qy = py as i32 + dy;
+            if qx >= 0 && (qx as usize) < fb_w && qy >= 0 && (qy as usize) < fb_h {
+                put16(fb, qy as usize * stride + qx as usize * bytes_pp, 0, 0, 0);
+            }
+        }
+    }
+    for &(px, py) in &pixels {
+        put16(fb, py * stride + px * bytes_pp, 0xFF, 0xFF, 0xFF);
+    }
+}
+
+fn lepton2_celsius(raw: u16) -> f32 {
+    const B: f32 = 1435.0;
+    const R1_OVER_R2: f32 = 18417.0 / 0.0125; // = 1_473_360
+    let signal = raw as f32 * 3.608 + 1851.0;
+    B / (R1_OVER_R2 / signal + 1.0).ln() - 273.15
+}
 
 // ── Pixel encoding helpers ───────────────────────────────────────────────────
 
@@ -317,53 +397,23 @@ fn char_bitmap(c: char) -> Option<[u8; 7]> {
         '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
         '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'X' => [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b01010, 0b10001],
+        ' ' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
         _ => return None,
     })
 }
 
-// Draw a single glyph rotated -90° (CCW) at screen position (ox, oy).
-// Rotated glyph is 7*scale wide × 5*scale tall.
-// Two passes: black outline first, white fill second — readable on any background.
-fn draw_glyph_rot90ccw(
-    fb: &mut [u8],
-    stride: usize,
-    bytes_pp: usize,
-    fb_w: usize,
-    fb_h: usize,
-    ox: usize,
-    oy: usize,
-    bm: [u8; 7],
-    scale: usize,
-) {
-    for pass in 0..2u8 {
-        for row in 0..7usize {
-            for col in 0..5usize {
-                if bm[row] & (0x10 >> col) == 0 { continue; }
-                // +90°: top row → left side, left col → bottom
-                for sy in 0..scale {
-                    let py = oy + (4 - col) * scale + sy;
-                    for sx in 0..scale {
-                        let px = ox + row * scale + sx;
-                        if pass == 0 {
-                            for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)] {
-                                let qx = px as i32 + dx;
-                                let qy = py as i32 + dy;
-                                if qx >= 0 && (qx as usize) < fb_w && qy >= 0 && (qy as usize) < fb_h {
-                                    put16(fb, qy as usize * stride + qx as usize * bytes_pp, 0, 0, 0);
-                                }
-                            }
-                        } else if px < fb_w && py < fb_h {
-                            put16(fb, py * stride + px * bytes_pp, 0xFF, 0xFF, 0xFF);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// Draw a string rotated -90°, characters stacked bottom-to-top, anchored at (ox, oy) top-left.
-fn draw_text_rot90ccw(
+// Draw a string with glyphs rotated 90° CCW, for a display mounted 90° CCW.
+// Characters stack so the string reads left-to-right on the physical display.
+// ox: screen x (= physical y, near physical top when small)
+// oy: screen y of the physical-left edge of the first character (near screen bottom)
+fn draw_text_ccw(
     fb: &mut [u8],
     stride: usize,
     bytes_pp: usize,
@@ -374,12 +424,41 @@ fn draw_text_rot90ccw(
     text: &str,
     scale: usize,
 ) {
-    let char_h = 5 * scale + 1; // rotated char height + 1px gap
-    let n = text.chars().count();
+    // Rotated glyph: screen_x = ox + row*scale, screen_y = oy + (4-col)*scale
+    // Each glyph is 7*scale wide × 5*scale tall in screen coords.
+    // Going right physically = decreasing screen_y → subtract char_step per char.
+    let char_step = 5 * scale + 1;
     for (i, c) in text.chars().enumerate() {
         let Some(bm) = char_bitmap(c) else { continue };
-        // +90° CW reads bottom-to-top → first char at bottom (largest y)
-        let cy = oy + (n - 1 - i) * char_h;
-        draw_glyph_rot90ccw(fb, stride, bytes_pp, fb_w, fb_h, ox, cy, bm, scale);
+        let char_oy = oy as isize - i as isize * char_step as isize;
+        if char_oy + 5 * scale as isize <= 0 { break; }
+        let char_oy = char_oy.max(0) as usize;
+        for pass in 0..2u8 {
+            for row in 0..7usize {
+                for col in 0..5usize {
+                    if bm[row] & (0x10 >> col) == 0 { continue; }
+                    for sy in 0..scale {
+                        let py = char_oy + (4 - col) * scale + sy;
+                        for sx in 0..scale {
+                            let px = ox + row * scale + sx;
+                            if pass == 0 {
+                                for dx in -2i32..=2 {
+                                    for dy in -2i32..=2 {
+                                        let qx = px as i32 + dx;
+                                        let qy = py as i32 + dy;
+                                        if qx >= 0 && (qx as usize) < fb_w && qy >= 0 && (qy as usize) < fb_h {
+                                            put16(fb, qy as usize * stride + qx as usize * bytes_pp, 0, 0, 0);
+                                        }
+                                    }
+                                }
+                            } else if px < fb_w && py < fb_h {
+                                put16(fb, py * stride + px * bytes_pp, 0xFF, 0xFF, 0xFF);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
+

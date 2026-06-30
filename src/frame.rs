@@ -21,10 +21,8 @@
 //     x ≥ 80:  buf[36 + 2*(y*164 + x)]
 //   (Two 2-pixel gaps per row account for the 164-pixel stride vs 160-pixel image.)
 //
-// FFC (Flat-Field Correction) frames appear as "FFC" at offset
-//   28 + ThermalSize + JpgSize + 17
-// within the status block.  These frames and the one immediately after must
-// be dropped to avoid a bright flash artefact.
+// FFC (Flat-Field Correction) frames: shutterState at JSON offset +17 starts with "FFC".
+// That frame and the next are dropped to avoid a bright-flash artefact.
 
 pub const THERMAL_W: usize = 160;
 pub const THERMAL_H: usize = 120;
@@ -36,9 +34,16 @@ const MAGIC: [u8; 4] = [0xEF, 0xBE, 0x00, 0x00];
 pub struct ThermalFrame {
     /// Min-max normalised grayscale, indexed [y * THERMAL_W + x].
     pub gray: [u8; THERMAL_W * THERMAL_H],
-    /// Raw centikelvins at the centre pixel (divide by 100 − 273.15 for °C).
     pub center_raw: u16,
+    pub min_raw: u16,
+    pub max_raw: u16,
+    pub min_pos: (usize, usize),
+    pub max_pos: (usize, usize),
 }
+
+// Valid thermal readings: 0°C ≈ raw 1635, so any frame with a pixel below 1000
+// is corrupt data (not physically possible at indoor temperatures).
+const MIN_VALID_RAW: u16 = 1000;
 
 pub struct FrameAccumulator {
     buf: Vec<u8>,
@@ -49,7 +54,7 @@ pub struct FrameAccumulator {
 #[derive(Clone, Copy, PartialEq)]
 enum FfcState {
     Normal,
-    SkipOne, // skip the first frame after an FFC shutter event
+    SkipOne,
 }
 
 impl FrameAccumulator {
@@ -67,8 +72,6 @@ impl FrameAccumulator {
             return None;
         }
 
-        // A magic header at the start of a chunk signals the beginning of a new
-        // frame; also reset if the buffer would overflow.
         if chunk.starts_with(&MAGIC) || self.len + chunk.len() >= BUF_SIZE {
             self.len = 0;
         }
@@ -76,14 +79,13 @@ impl FrameAccumulator {
         self.buf[self.len..self.len + chunk.len()].copy_from_slice(chunk);
         self.len += chunk.len();
 
-        // Sanity: the accumulated data must still start with the magic bytes.
         if self.len < 4 || self.buf[..4] != MAGIC {
             self.len = 0;
             return None;
         }
 
         if self.len < 28 {
-            return None; // header not yet complete
+            return None;
         }
 
         let frame_size = u32_le(&self.buf, 8) as usize;
@@ -92,15 +94,16 @@ impl FrameAccumulator {
 
         let total = frame_size + 28;
         if self.len < total {
-            return None; // still accumulating chunks
+            return None;
         }
 
-        // Check for FFC shutter event in the status block.
+        // shutterState is the first JSON field; its value starts at offset +17.
+        // When the shutter is doing FFC the value begins with "FFC".
         let ffc_offset = 28 + thermal_size + jpg_size + 17;
         let is_ffc = ffc_offset + 3 <= total
             && self.buf[ffc_offset..ffc_offset + 3] == *b"FFC";
 
-        self.len = 0; // frame consumed regardless
+        self.len = 0;
 
         if is_ffc {
             self.ffc = FfcState::SkipOne;
@@ -112,7 +115,13 @@ impl FrameAccumulator {
             return None;
         }
 
-        Some(extract_thermal(&self.buf[..total]))
+        let frame = extract_thermal(&self.buf[..total]);
+
+        if frame.min_raw < MIN_VALID_RAW {
+            return None;
+        }
+
+        Some(frame)
     }
 }
 
@@ -120,10 +129,11 @@ fn extract_thermal(frame: &[u8]) -> ThermalFrame {
     let mut raw = [0u16; THERMAL_W * THERMAL_H];
     let mut min = u16::MAX;
     let mut max = u16::MIN;
+    let mut min_pos = (0, 0);
+    let mut max_pos = (0, 0);
 
     for y in 0..THERMAL_H {
         for x in 0..THERMAL_W {
-            // The two-pixel gap in each row half is handled by the +4 offset for x ≥ 80.
             let base = if x < 80 {
                 32 + 2 * (y * THERMAL_STRIDE + x)
             } else {
@@ -131,20 +141,13 @@ fn extract_thermal(frame: &[u8]) -> ThermalFrame {
             };
             let v = u16::from_le_bytes([frame[base], frame[base + 1]]);
             raw[y * THERMAL_W + x] = v;
-            if v < min {
-                min = v;
-            }
-            if v > max {
-                max = v;
-            }
+            if v < min { min = v; min_pos = (x, y); }
+            if v > max { max = v; max_pos = (x, y); }
         }
     }
 
-    // Min-max normalise to 8-bit. Use rounded integer division so the hottest
-    // pixel maps to exactly 255 (not 250-254 as with the fixed-point approach).
     let delta = (max - min) as u32;
-
-    let mut gray: [u8; 19200] = [0u8; THERMAL_W * THERMAL_H];
+    let mut gray = [0u8; THERMAL_W * THERMAL_H];
     for i in 0..THERMAL_W * THERMAL_H {
         gray[i] = if delta == 0 {
             0
@@ -154,7 +157,7 @@ fn extract_thermal(frame: &[u8]) -> ThermalFrame {
     }
 
     let center_raw = raw[(THERMAL_H / 2) * THERMAL_W + THERMAL_W / 2];
-    ThermalFrame { gray, center_raw }
+    ThermalFrame { gray, center_raw, min_raw: min, max_raw: max, min_pos, max_pos }
 }
 
 fn u32_le(buf: &[u8], off: usize) -> u32 {
