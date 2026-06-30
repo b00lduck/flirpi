@@ -126,7 +126,8 @@ for an ILI9341 (320×240) on default SPI pins:
 dtoverlay=ili9341,speed=32000000,rotate=90
 ```
 
-After reboot, `/dev/fb1` should appear (fb0 is usually the HDMI output).
+After reboot a framebuffer device will appear — `/dev/fb0` on a headless setup
+(no HDMI), `/dev/fb1` if HDMI is also active.
 
 ---
 

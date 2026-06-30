@@ -24,10 +24,9 @@ fn main() {
     let mut fb = match display::Framebuffer::open(fb_path) {
         Ok(fb) => {
             eprintln!(
-                "flirpi: framebuffer {}×{} {}bpp",
-                fb.width(),
-                fb.height(),
-                fb.bpp()
+                "flirpi: framebuffer {}x{} {}bpp  {}",
+                fb.width(), fb.height(), fb.bpp(),
+                fb.pixel_format_str()
             );
             fb
         }

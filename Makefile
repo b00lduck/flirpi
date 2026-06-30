@@ -40,5 +40,6 @@ clean:
 # Usage: make deploy HOST=pi@192.168.x.x
 # Uses whichever binary was built last (cross or cross-docker).
 deploy:
-	scp target/$(TARGET)/release/flirpi $(HOST):~/flirpi
+	scp target/$(TARGET)/release/flirpi $(HOST):~/flirpi || \
+		(ssh $(HOST) 'killall flirpi'; scp target/$(TARGET)/release/flirpi $(HOST):~/flirpi)
 	@echo "Deployed to $(HOST)"

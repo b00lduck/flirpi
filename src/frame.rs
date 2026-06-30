@@ -138,14 +138,17 @@ fn extract_thermal(frame: &[u8]) -> ThermalFrame {
         }
     }
 
-    // Min-max normalise to 8-bit.
+    // Min-max normalise to 8-bit. Use rounded integer division so the hottest
+    // pixel maps to exactly 255 (not 250-254 as with the fixed-point approach).
     let delta = (max - min) as u32;
-    let scale = if delta > 0 { 0x10000u32 / delta } else { 1 };
 
-    let mut gray = [0u8; THERMAL_W * THERMAL_H];
+    let mut gray: [u8; 19200] = [0u8; THERMAL_W * THERMAL_H];
     for i in 0..THERMAL_W * THERMAL_H {
-        let v = ((raw[i] - min) as u32 * scale) >> 8;
-        gray[i] = v.min(255) as u8;
+        gray[i] = if delta == 0 {
+            0
+        } else {
+            (((raw[i] - min) as u32 * 255 + delta / 2) / delta) as u8
+        };
     }
 
     ThermalFrame { gray }

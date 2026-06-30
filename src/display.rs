@@ -177,6 +177,19 @@ impl Framebuffer {
         self.vinfo.bits_per_pixel
     }
 
+    pub fn pixel_format_str(&self) -> String {
+        let vi = &self.vinfo;
+        format!(
+            "R[off={} len={}] G[off={} len={}] B[off={} len={}]",
+            vi.red.offset,
+            vi.red.length,
+            vi.green.offset,
+            vi.green.length,
+            vi.blue.offset,
+            vi.blue.length,
+        )
+    }
+
     /// Write a thermal frame to the framebuffer, scaling to fill the screen.
     pub fn draw_thermal(&mut self, frame: &ThermalFrame, palette: &[[u8; 3]; 256]) {
         let fb_w = self.vinfo.xres as usize;
@@ -187,13 +200,35 @@ impl Framebuffer {
 
         let fb = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.map_size) };
 
+        let tw = THERMAL_W as f32;
+        let th = THERMAL_H as f32;
+
         for dy in 0..fb_h {
-            let sy = dy * THERMAL_H / fb_h;
+            // Map output pixel centre into source space.
+            let sy_f = (dy as f32 + 0.5) * th / fb_h as f32 - 0.5;
+            let sy0 = (sy_f as isize).clamp(0, THERMAL_H as isize - 1) as usize;
+            let sy1 = (sy0 + 1).min(THERMAL_H - 1);
+            let ty = sy_f - sy0 as f32;
             let row_off = dy * stride;
 
             for dx in 0..fb_w {
-                let sx = dx * THERMAL_W / fb_w;
-                let [r, g, b] = palette[frame.gray[sy * THERMAL_W + sx] as usize];
+                let sx_f = (dx as f32 + 0.5) * tw / fb_w as f32 - 0.5;
+                let sx0 = (sx_f as isize).clamp(0, THERMAL_W as isize - 1) as usize;
+                let sx1 = (sx0 + 1).min(THERMAL_W - 1);
+                let tx = sx_f - sx0 as f32;
+
+                // Bilinear interpolation in grayscale space, then palette lookup.
+                let g00 = frame.gray[sy0 * THERMAL_W + sx0] as f32;
+                let g10 = frame.gray[sy0 * THERMAL_W + sx1] as f32;
+                let g01 = frame.gray[sy1 * THERMAL_W + sx0] as f32;
+                let g11 = frame.gray[sy1 * THERMAL_W + sx1] as f32;
+                let gray = (g00 * (1.0 - tx) * (1.0 - ty)
+                    + g10 * tx * (1.0 - ty)
+                    + g01 * (1.0 - tx) * ty
+                    + g11 * tx * ty
+                    + 0.5) as u8;
+
+                let [r, g, b] = palette[gray as usize];
 
                 let off = row_off + dx * bytes_pp;
 
@@ -201,22 +236,11 @@ impl Framebuffer {
                     16 => {
                         // Encode using the hardware-reported channel layout (handles both
                         // RGB565 and BGR565 drivers).
-                        let pixel = encode16(r, g, b, &self.vinfo);
+                        let pixel = encode565(r, g, b);
                         // Use native byte order; fbtft drivers expect host-endian values.
-                        let bytes = pixel.to_ne_bytes();
+                        let bytes = pixel.to_le_bytes();
                         fb[off] = bytes[0];
                         fb[off + 1] = bytes[1];
-                    }
-                    32 => {
-                        let pixel = encode32(r, g, b, &self.vinfo);
-                        let bytes = pixel.to_ne_bytes();
-                        fb[off..off + 4].copy_from_slice(&bytes);
-                    }
-                    24 => {
-                        // 24-bit packed; kernel reports offsets in bits.
-                        write_channel(fb, off, r, &self.vinfo.red);
-                        write_channel(fb, off, g, &self.vinfo.green);
-                        write_channel(fb, off, b, &self.vinfo.blue);
                     }
                     _ => {}
                 }
@@ -239,21 +263,6 @@ unsafe impl Send for Framebuffer {}
 
 // ── Pixel encoding helpers ───────────────────────────────────────────────────
 
-fn encode16(r: u8, g: u8, b: u8, vi: &FbVarScreeninfo) -> u16 {
-    let r = (r as u16) >> (8 - vi.red.length);
-    let g = (g as u16) >> (8 - vi.green.length);
-    let b = (b as u16) >> (8 - vi.blue.length);
-    (r << vi.red.offset) | (g << vi.green.offset) | (b << vi.blue.offset)
-}
-
-fn encode32(r: u8, g: u8, b: u8, vi: &FbVarScreeninfo) -> u32 {
-    ((r as u32) << vi.red.offset)
-        | ((g as u32) << vi.green.offset)
-        | ((b as u32) << vi.blue.offset)
-}
-
-fn write_channel(fb: &mut [u8], pixel_off: usize, val: u8, bf: &FbBitfield) {
-    // bf.offset is in bits from the LSB of the pixel's first byte
-    let byte_off = pixel_off + (bf.offset / 8) as usize;
-    fb[byte_off] = val;
+fn encode565(r: u8, g: u8, b: u8) -> u16 {
+    ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
 }
