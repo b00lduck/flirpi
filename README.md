@@ -90,13 +90,13 @@ make release    # optimised
 ## Deploying to the Pi
 
 ```bash
-make deploy HOST=pi@192.168.x.x
+make deploy HOST=user@hostname
 ```
 
 Or manually:
 
 ```bash
-scp target/armv7-unknown-linux-gnueabihf/release/flirpi pi@192.168.x.x:~/
+scp target/armv7-unknown-linux-gnueabihf/release/flirpi user@hostname:~/
 ```
 
 ---
@@ -105,7 +105,7 @@ scp target/armv7-unknown-linux-gnueabihf/release/flirpi pi@192.168.x.x:~/
 
 ### USB access without root
 
-Create `/etc/udev/rules.d/77-flirone.rules`:
+Create `/etc/udev/rules.d/99-flirone.rules`:
 
 ```
 SUBSYSTEM=="usb", ATTRS{idVendor}=="09cb", ATTRS{idProduct}=="1996", MODE="0666"
@@ -119,15 +119,44 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ### SPI LCD framebuffer
 
-Enable the fbtft driver for your display in `/boot/config.txt`, for example
-for an ILI9341 (320×240) on default SPI pins:
+Enable SPI and the fbtft driver in `/boot/config.txt`.  The Pi uses a
+**WaveShare 3.5" TFT (tft35a, 480×320)** on the default SPI pins:
 
 ```
-dtoverlay=ili9341,speed=32000000,rotate=90
+dtparam=spi=on
+dtoverlay=tft35a,rotate=90,speed=32000000
 ```
 
-After reboot a framebuffer device will appear — `/dev/fb0` on a headless setup
-(no HDMI), `/dev/fb1` if HDMI is also active.
+After reboot two framebuffer devices are present — `/dev/fb0` (HDMI) and
+`/dev/fb1` (SPI LCD).
+
+### Running as a systemd service
+
+Create `/etc/systemd/system/flirpi.service`:
+
+```ini
+[Unit]
+Description=FLIR One thermal camera display
+After=local-fs.target
+
+[Service]
+ExecStart=/home/daniel/flirpi --fb /dev/fb1
+Restart=always
+RestartSec=2
+User=daniel
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now flirpi
+```
 
 ---
 
@@ -137,7 +166,7 @@ After reboot a framebuffer device will appear — `/dev/fb0` on a headless setup
 # Default: reads from /dev/fb0
 flirpi
 
-# Specify framebuffer device (e.g. SPI LCD is fb1)
+# Specify framebuffer device (SPI LCD on the reference Pi)
 flirpi --fb /dev/fb1
 ```
 
